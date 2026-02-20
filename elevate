@@ -1,0 +1,502 @@
+#!/bin/bash
+# elevate — CLI for Elevate24 Privileged Access Management
+# Wraps AppleScript UI automation for command-line elevation control.
+# Requires: macOS, Elevate24.app, Accessibility permissions for terminal
+
+set -euo pipefail
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+ELEVATE_VERSION="1.0.0"
+APP_NAME="Elevate24"
+APP_PATH="/Applications/Elevate24.app"
+MANAGED_PREFS="/Library/Managed Preferences/com.jigsaw24.Elevate24.plist"
+DEFAULT_REASON="Run scripts"
+DEFAULT_TIMEOUT=30
+POLL_INTERVAL=2
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+COMMAND=""
+OPT_QUIET=false
+OPT_NO_COLOR=false
+OPT_TIMEOUT=$DEFAULT_TIMEOUT
+OPT_REASON="$DEFAULT_REASON"
+OPT_EXEC=()  # command to run after elevation (from -- args)
+RED="" GREEN="" YELLOW="" BLUE="" BOLD="" DIM="" RESET=""
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+_setup_colors() {
+    if [[ "$OPT_NO_COLOR" == true ]] || ! [[ -t 1 ]]; then return; fi
+    RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m'
+    BLUE=$'\033[34m' BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
+}
+
+# ── Output ────────────────────────────────────────────────────────────────────
+_info()      { [[ "$OPT_QUIET" == true ]] || printf '%s\n' "$*"; }
+_success()   { [[ "$OPT_QUIET" == true ]] || printf '%s\n' "${GREEN}$*${RESET}"; }
+_warn()      { printf '%s\n' "${YELLOW}$*${RESET}" >&2; }
+_error()     { printf '%s\n' "${RED}$*${RESET}" >&2; }
+_die()       { _error "$@"; exit 1; }
+_die_usage() { _error "$@"; printf '%s\n' "Run 'elevate help' for usage." >&2; exit 2; }
+
+# ── External Command Wrappers (overridable for testing) ──────────────────────
+_osascript()     { osascript "$@"; }
+_dseditgroup()   { dseditgroup "$@"; }
+_pgrep()         { pgrep "$@"; }
+_defaults_read() { defaults read "$@"; }
+_pbpaste()       { pbpaste; }
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+_check_app_installed() { [[ -d "$APP_PATH" ]]; }
+_check_app_running()   { _pgrep -x "$APP_NAME" >/dev/null 2>&1; }
+
+_check_accessibility() {
+    local out
+    out=$(_osascript -e 'tell application "System Events" to get name of process "'"$APP_NAME"'"' 2>&1) || return 1
+    [[ "$out" == "$APP_NAME" ]]
+}
+
+_preflight() {
+    _check_app_installed || _die "$APP_NAME is not installed at $APP_PATH"
+    _check_app_running   || _die "$APP_NAME is not running. Check your menu bar."
+    _check_accessibility || _die "Accessibility not granted. Enable in System Settings > Privacy & Security > Accessibility."
+}
+
+# ── Status Detection ─────────────────────────────────────────────────────────
+_is_admin() {
+    local out
+    out=$(_dseditgroup -o checkmember -m "$(whoami)" admin 2>&1) || true
+    [[ "$out" == *"is a member"* ]]
+}
+
+_get_menu_bar_status() {
+    _osascript -e 'tell application "System Events" to tell process "'"$APP_NAME"'" to return accessibility description of menu bar item 1 of menu bar 2' 2>/dev/null || echo "unknown"
+}
+
+_get_session_time() {
+    _defaults_read "$MANAGED_PREFS" Sessiontime 2>/dev/null || echo "600"
+}
+
+# ── AppleScript: Close Popover ────────────────────────────────────────────────
+_as_close_popover() {
+    _osascript -e 'tell application "System Events" to tell process "'"$APP_NAME"'"
+    if (count of pop overs of menu bar 2) > 0 then click menu bar item 1 of menu bar 2
+end tell' >/dev/null 2>&1 || true
+}
+
+# ── AppleScript: Read All Popover Texts ───────────────────────────────────────
+_as_read_popover_texts() {
+    _osascript -e 'tell application "System Events"
+    tell process "'"$APP_NAME"'"
+        if (count of pop overs of menu bar 2) = 0 then
+            click menu bar item 1 of menu bar 2
+            delay 1
+        end if
+        if (count of pop overs of menu bar 2) = 0 then return ""
+        set allTexts to {}
+        set allElems to entire contents of pop over 1 of menu bar 2
+        repeat with elem in allElems
+            try
+                set r to role of elem
+                if r is "AXStaticText" then
+                    set v to value of elem as text
+                    if v is not "" and v is not "missing value" then
+                        set end of allTexts to ("TEXT:" & v)
+                    end if
+                else if r is "AXTextField" then
+                    set v to value of elem as text
+                    if v is not "" and v is not "missing value" then
+                        set end of allTexts to ("FIELD:" & v)
+                    end if
+                end if
+            end try
+        end repeat
+        click menu bar item 1 of menu bar 2
+        set AppleScript'\''s text item delimiters to linefeed
+        return allTexts as text
+    end tell
+end tell' 2>/dev/null || echo ""
+}
+
+# ── AppleScript: Start Session ────────────────────────────────────────────────
+_as_start_session() {
+    local reason="$1"
+    # Safety: reject reasons with characters that break AppleScript embedding
+    if [[ "$reason" == *'"'* ]] || [[ "$reason" == *'\\'* ]]; then
+        echo "ERROR:Reason contains invalid characters"
+        return 0
+    fi
+    _osascript -e 'tell application "System Events"
+    tell process "'"$APP_NAME"'"
+        click menu bar item 1 of menu bar 2
+        delay 1
+        if (count of pop overs of menu bar 2) = 0 then return "ERROR:Popover did not open"
+        try
+            tell group 1 of group 1 of pop over 1 of menu bar 2
+                click pop up button 1
+                delay 0.5
+                try
+                    click menu item "'"$reason"'" of menu 1 of pop up button 1
+                on error
+                    key code 53
+                    delay 0.3
+                    tell application "System Events" to tell process "'"$APP_NAME"'" to click menu bar item 1 of menu bar 2
+                    return "ERROR:Reason not found: '"$reason"'"
+                end try
+                delay 0.5
+                if not (enabled of button 1) then
+                    tell application "System Events" to tell process "'"$APP_NAME"'" to click menu bar item 1 of menu bar 2
+                    return "ERROR:Start button did not enable after selecting reason"
+                end if
+                click button 1
+            end tell
+        on error errMsg
+            try
+                click menu bar item 1 of menu bar 2
+            end try
+            return "ERROR:" & errMsg
+        end try
+        return "OK"
+    end tell
+end tell' 2>&1
+}
+
+# ── AppleScript: Extend Session ───────────────────────────────────────────────
+_as_extend_session() {
+    # Active session layout: pop over 1 > group 1 > group 1
+    #   button 1 = End Session, button 2 = Extend
+    _osascript -e 'tell application "System Events"
+    tell process "'"$APP_NAME"'"
+        click menu bar item 1 of menu bar 2
+        delay 1
+        if (count of pop overs of menu bar 2) = 0 then return "ERROR:Popover did not open"
+        try
+            tell group 1 of group 1 of pop over 1 of menu bar 2
+                click button 2
+            end tell
+        on error errMsg
+            try
+                click menu bar item 1 of menu bar 2
+            end try
+            return "ERROR:Extend button not found — " & errMsg
+        end try
+        delay 0.3
+        click menu bar item 1 of menu bar 2
+        return "OK"
+    end tell
+end tell' 2>&1
+}
+
+# ── AppleScript: End Session ──────────────────────────────────────────────────
+_as_end_session() {
+    # Active session layout: pop over 1 > group 1 > group 1
+    #   button 1 = End Session, button 2 = Extend
+    _osascript -e 'tell application "System Events"
+    tell process "'"$APP_NAME"'"
+        click menu bar item 1 of menu bar 2
+        delay 1
+        if (count of pop overs of menu bar 2) = 0 then return "ERROR:Popover did not open"
+        try
+            tell group 1 of group 1 of pop over 1 of menu bar 2
+                click button 1
+            end tell
+        on error errMsg
+            try
+                click menu bar item 1 of menu bar 2
+            end try
+            return "ERROR:End Session button not found — " & errMsg
+        end try
+        delay 0.3
+        click menu bar item 1 of menu bar 2
+        return "OK"
+    end tell
+end tell' 2>&1
+}
+
+# ── Credential Capture ────────────────────────────────────────────────────────
+_capture_credentials() {
+    local texts
+    texts=$(_as_read_popover_texts) || return 1
+    [[ -z "$texts" || "$texts" == ERROR:* ]] && return 1
+
+    local username="" password=""
+    local prev_label=""
+    while IFS= read -r line; do
+        local value="${line#*:}"
+        [[ -z "$value" ]] && continue
+
+        # Skip known boilerplate
+        case "$value" in
+            "Local Admin Management"|"2.3.2"|*"maintain system security"*|*"Select Reason"*) continue ;;
+        esac
+
+        # Check if this is a credential label
+        case "$value" in
+            *"User"*[Nn]"ame"*|*"sername"*)
+                prev_label="username"; continue ;;
+            *[Pp]"assword"*)
+                prev_label="password"; continue ;;
+        esac
+
+        # If previous line was a label, this is the value
+        if [[ "$prev_label" == "username" ]]; then
+            username="$value"
+            prev_label=""
+            continue
+        fi
+        if [[ "$prev_label" == "password" ]]; then
+            password="$value"
+            prev_label=""
+            continue
+        fi
+        prev_label=""
+    done <<< "$texts"
+
+    if [[ -n "$username" || -n "$password" ]]; then
+        _info ""
+        _info "${BOLD}Temporary Admin Credentials:${RESET}"
+        [[ -n "$username" ]] && _info "  Username: ${BOLD}${username}${RESET}"
+        [[ -n "$password" ]] && _info "  Password: ${BOLD}${password}${RESET}"
+        _info ""
+        _warn "Credentials visible for ~30 seconds in the Elevate24 popover"
+        return 0
+    fi
+
+    # Fallback: dump all non-boilerplate text for the user to inspect
+    local found_any=false
+    while IFS= read -r line; do
+        local value="${line#*:}"
+        [[ -z "$value" ]] && continue
+        case "$value" in
+            "Local Admin Management"|"2.3.2"|*"maintain system security"*|*"Select Reason"*) continue ;;
+        esac
+        if [[ "$found_any" == false ]]; then
+            _info ""
+            _info "${BOLD}Popover contents (check for credentials):${RESET}"
+            found_any=true
+        fi
+        _info "  ${DIM}${value}${RESET}"
+    done <<< "$texts"
+    [[ "$found_any" == true ]] && return 0
+    return 1
+}
+
+# ── Command: status ───────────────────────────────────────────────────────────
+cmd_status() {
+    _preflight
+
+    local admin=false
+    _is_admin && admin=true
+
+    local menu_status session_time session_min
+    menu_status=$(_get_menu_bar_status)
+    session_time=$(_get_session_time)
+    session_min=$((session_time / 60))
+
+    if [[ "$admin" == true ]]; then
+        _info "${GREEN}${BOLD}ELEVATED${RESET}"
+        _info "${DIM}Session duration: ${session_min} minutes${RESET}"
+        _info "${DIM}Menu bar: ${menu_status}${RESET}"
+
+        # Read popover for countdown/time remaining
+        local texts
+        texts=$(_as_read_popover_texts) || texts=""
+        if [[ -n "$texts" && "$texts" != ERROR:* ]]; then
+            while IFS= read -r line; do
+                local value="${line#*:}"
+                case "$value" in
+                    *"removed in"*|*"remaining"*|*[0-9]":"[0-9]*)
+                        _info "${DIM}${value}${RESET}" ;;
+                esac
+            done <<< "$texts"
+        fi
+    else
+        _info "${YELLOW}${BOLD}NOT ELEVATED${RESET}"
+        _info "${DIM}Session duration: ${session_min} minutes${RESET}"
+        _info "${DIM}Menu bar: ${menu_status}${RESET}"
+    fi
+}
+
+# ── Command: start ────────────────────────────────────────────────────────────
+cmd_start() {
+    _preflight
+
+    if _is_admin; then
+        _warn "Already elevated as admin"
+        cmd_status
+        return 0
+    fi
+
+    _info "Starting elevation with reason: ${BOLD}${OPT_REASON}${RESET}"
+
+    local result
+    result=$(_as_start_session "$OPT_REASON")
+
+    if [[ "$result" == ERROR:* ]]; then
+        _as_close_popover
+        _die "${result#ERROR:}"
+    fi
+
+    _info "${YELLOW}Waiting for Touch ID authentication...${RESET}"
+
+    local auth_timeout=60
+    [[ "$OPT_TIMEOUT" -gt 60 ]] && auth_timeout="$OPT_TIMEOUT"
+
+    local elapsed=0
+    while [[ $elapsed -lt $auth_timeout ]]; do
+        if _is_admin; then
+            _success "Elevation successful!"
+            _as_close_popover
+
+            # Run trailing command if provided
+            if [[ ${#OPT_EXEC[@]} -gt 0 ]]; then
+                _info "Running: ${OPT_EXEC[*]}"
+                "${OPT_EXEC[@]}"
+                return $?
+            fi
+            return 0
+        fi
+        sleep $POLL_INTERVAL
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    _as_close_popover
+    _die "Timed out waiting for elevation (${auth_timeout}s). Touch ID may have been cancelled."
+}
+
+# ── Command: extend ───────────────────────────────────────────────────────────
+cmd_extend() {
+    _preflight
+    _is_admin || _die "Not currently elevated. Use 'elevate start' first."
+
+    _info "Extending admin session..."
+
+    local result
+    result=$(_as_extend_session)
+
+    if [[ "$result" == ERROR:* ]]; then
+        _die "${result#ERROR:}"
+    fi
+
+    _success "Session extended"
+}
+
+# ── Command: end ──────────────────────────────────────────────────────────────
+cmd_end() {
+    _preflight
+
+    if ! _is_admin; then
+        _info "Not currently elevated — nothing to end."
+        return 0
+    fi
+
+    _info "Revoking admin privileges..."
+
+    local result
+    result=$(_as_end_session)
+
+    if [[ "$result" == ERROR:* ]]; then
+        _die "${result#ERROR:}"
+    fi
+
+    local elapsed=0
+    while [[ $elapsed -lt 10 ]]; do
+        if ! _is_admin; then
+            _success "Admin privileges revoked"
+            return 0
+        fi
+        sleep $POLL_INTERVAL
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    _warn "Demotion not confirmed after 10s. Check 'elevate status' to verify."
+}
+
+# ── Command: help ─────────────────────────────────────────────────────────────
+cmd_help() {
+    cat <<EOF
+${BOLD}elevate${RESET} — CLI for Elevate24 Privileged Access Management
+
+${BOLD}Usage:${RESET} elevate <command> [options]
+
+${BOLD}Commands:${RESET}
+  status    Show current elevation status
+  start     Request admin elevation
+  extend    Extend current admin session
+  end       End admin session / revoke privileges
+  help      Show this help message
+
+${BOLD}Options:${RESET}
+  --reason <text>   Reason for elevation (start only, default: "$DEFAULT_REASON")
+  --quiet           Suppress informational output
+  --no-color        Disable colored output
+  --timeout <sec>   Max wait for UI operations (default: $DEFAULT_TIMEOUT)
+  -- <command>      Run command after successful elevation (start only)
+
+${BOLD}Examples:${RESET}
+  elevate status
+  elevate start
+  elevate start --reason "System diagnostics"
+  elevate start -- sudo softwareupdate -i -a
+  elevate start -- sudo ls /var/root
+  elevate extend
+  elevate end
+
+${BOLD}Exit Codes:${RESET}
+  0  Success
+  1  Error
+  2  Usage error
+EOF
+}
+
+# ── Argument Parsing ──────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --)
+                shift
+                OPT_EXEC=("$@")
+                break ;;
+            status|start|extend|end|help)
+                [[ -n "$COMMAND" ]] && _die_usage "Multiple commands: '$COMMAND' and '$1'"
+                COMMAND="$1"; shift ;;
+            --reason)
+                [[ $# -lt 2 ]] && _die_usage "--reason requires an argument"
+                OPT_REASON="$2"; shift 2 ;;
+            --quiet|-q)
+                OPT_QUIET=true; shift ;;
+            --no-color)
+                OPT_NO_COLOR=true; shift ;;
+            --timeout)
+                [[ $# -lt 2 ]] && _die_usage "--timeout requires an argument"
+                [[ "$2" =~ ^[0-9]+$ ]] || _die_usage "--timeout must be a positive integer"
+                OPT_TIMEOUT="$2"; shift 2 ;;
+            --help|-h)
+                COMMAND="help"; shift ;;
+            --version|-v)
+                echo "elevate $ELEVATE_VERSION"; exit 0 ;;
+            -*)
+                _die_usage "Unknown option: $1" ;;
+            *)
+                _die_usage "Unknown command: $1" ;;
+        esac
+    done
+    [[ -n "$COMMAND" ]] || _die_usage "No command specified."
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+    _setup_colors
+    case "$COMMAND" in
+        status) cmd_status ;;
+        start)  cmd_start ;;
+        extend) cmd_extend ;;
+        end)    cmd_end ;;
+        help)   cmd_help ;;
+    esac
+}
+
+# Only run main when not sourced for testing
+if [[ "${ELEVATE_TESTING:-}" != "1" ]]; then
+    main "$@"
+fi

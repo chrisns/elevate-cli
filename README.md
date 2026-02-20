@@ -1,4 +1,4 @@
-# elevate
+# elevate-cli
 
 A CLI for [Elevate24](https://www.jigsaw24.com/) — the macOS Privileged Access Management agent by Jigsaw24.
 
@@ -8,7 +8,7 @@ Elevate24 provides time-limited admin elevation via a menu bar app, but has no C
 
 ```bash
 # Install
-git clone <repo-url> && cd elevateautomate
+git clone https://github.com/chrisns/elevate-cli.git && cd elevate-cli
 bash install.sh
 
 # Check current status
